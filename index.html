@@ -330,7 +330,7 @@ function groupByDay(items, key = 'start_time') {
    .map(([day, rows]) => ({ day, rows: rows.sort((a, b) => String(a[key]).localeCompare(String(b[key]))) }))
 }
 
-const nameOf = (members, id, fallback = 'Someone') =>
+const nameOf = (members, id, fallback = 'Former member') =>
  members.find((m) => m.id === id)?.name || fallback
 
 /**
@@ -374,6 +374,22 @@ function avatarTint(id = '') {
 }
 
 const CATEGORIES = ['Travel', 'Stay', 'Food', 'Activities', 'Shopping', 'Other']
+
+/**
+* Only ever render http(s). A stored 'javascript:' or 'data:' URL would
+* execute on click, so anything else becomes an inert '#'. The database has a
+* matching constraint; this is the second line, because a row could predate it.
+*/
+function safeUrl(url) {
+ const trimmed = String(url || '').trim()
+ return /^https?:\/\/[^\s]+$/i.test(trimmed) ? trimmed : '#'
+}
+
+/** A phone number safe to put after tel:. */
+function telUrl(phone) {
+ const cleaned = String(phone || '').replace(/[^\d+]/g, '')
+ return cleaned ? `tel:${cleaned}` : '#'
+}
 
 /** "drive.google.com" out of a full URL, for a tidy link row. */
 function hostOf(url) {
@@ -465,10 +481,23 @@ function splitEqual(total, userIds) {
  })
 }
 
-/** Net position per member: positive means the group owes them. */
+/**
+* Net position per person: positive means the group owes them.
+*
+* Anyone who appears in the money is included, not only current members. If
+* somebody leaves a trip mid-way their share does not evaporate — it would
+* leave the ledger unbalanced and quietly change what everybody else owes.
+* The settle-up view labels them as a former member.
+*/
 function netBalances(expenses, settlements, memberIds) {
  const net = {}
  for (const id of memberIds) net[id] = 0
+ const involve = (id) => { if (id && !(id in net)) net[id] = 0 }
+ for (const e of expenses) {
+   involve(e.paid_by)
+   for (const s of e.expense_shares || []) involve(s.user_id)
+ }
+ for (const s of settlements) { involve(s.from_user); involve(s.to_user) }
  const bump = (id, delta) => { if (id in net) net[id] += delta }
  for (const e of expenses) {
    bump(e.paid_by, Number(e.amount))
@@ -478,7 +507,7 @@ function netBalances(expenses, settlements, memberIds) {
    bump(s.from_user, Number(s.amount))
    bump(s.to_user, -Number(s.amount))
  }
- for (const id of memberIds) net[id] = round2(net[id])
+ for (const id of Object.keys(net)) net[id] = round2(net[id])
  return net
 }
 
@@ -520,13 +549,20 @@ function classify(error) {
    return 'denied'
  }
  if (code === 'PGRST116' || /0 rows/i.test(msg)) return 'missing'
+ if (code === '23514' || /check constraint/i.test(msg)) return 'invalid'
+ if (code === '23505' || /duplicate key/i.test(msg)) return 'duplicate'
  return 'failed'
 }
 
-/** Anything interested in a global failure (session, connection) listens here. */
+/**
+* Anything interested in a failure listens here. Every failed request is
+* announced, because most inline actions — ticking a checklist item, voting,
+* clearing an RSVP — are fire-and-forget: without this, a refusal or a dropped
+* connection would look exactly like success.
+*/
 const appFault = {
  listeners: new Set(),
- emit(kind) { for (const fn of this.listeners) fn(kind) },
+ emit(kind, error) { for (const fn of this.listeners) fn(kind, error) },
  watch(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn) },
 }
 
@@ -545,12 +581,12 @@ async function run(query) {
    result = await query
  } catch (networkError) {
    const wrapped = new DataError(networkError)
-   appFault.emit(wrapped.kind)
+   appFault.emit(wrapped.kind, wrapped)
    throw wrapped
  }
  if (result.error) {
    const wrapped = new DataError(result.error)
-   if (wrapped.kind === 'expired' || wrapped.kind === 'offline') appFault.emit(wrapped.kind)
+   appFault.emit(wrapped.kind, wrapped)
    throw wrapped
  }
  return result.data
@@ -757,14 +793,13 @@ const api = {
    ))
  },
 
- /** Ticking a stop off during the trip moves it to the completed plan. */
- async completeStop(itemId, done) {
-   const id = await uid()
-   return run(sb.from('itinerary_items').update({
-     completed_at: done ? new Date().toISOString() : null,
-     completed_by: done ? id : null,
-   }).eq('id', itemId).select().single())
- },
+ /**
+  * Ticking a stop off moves it to the completed plan. This goes through an
+  * RPC, not a direct update: stop_update restricts edits to the stop's
+  * author, but completing one is something any member on the trip can do.
+  */
+ completeStop: (itemId, done) =>
+   run(sb.rpc('complete_stop', { p_item: itemId, p_done: done })),
 
  /** Permanent: every itinerary, expense and message for the trip goes too. */
  deleteTrip: (tripId) => run(sb.from('trips').delete().eq('id', tripId)),
@@ -899,6 +934,37 @@ function BootScreen({ label = 'Getting your trips' }) {
  )
 }
 
+/**
+* A quiet line at the foot of the screen for failures nothing else reports.
+* Expiry has its own screen, so it is skipped here.
+*/
+function FaultToast() {
+ const [fault, setFault] = useState(null)
+ useEffect(() => appFault.watch((kind, error) => {
+   if (kind === 'expired') return
+   setFault({ kind, text: FRIENDLY[kind] || String(error?.message || 'Something went wrong') })
+ }), [])
+ useEffect(() => {
+   if (!fault) return
+   const t = setTimeout(() => setFault(null), 6000)
+   return () => clearTimeout(t)
+ }, [fault])
+
+ if (!fault) return null
+ return ReactDOM.createPortal(
+   <div className="pointer-events-none fixed inset-x-0 bottom-0 z-[70] flex justify-center p-4">
+     <div role="status"
+       className="pointer-events-auto flex max-w-md items-start gap-3 rounded-lg border border-alert/25 bg-white px-3.5 py-2.5 text-[13px] text-ink shadow-lift">
+       <span className="mt-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-alert" aria-hidden="true" />
+       <span className="flex-1">{fault.text}</span>
+       <button type="button" className="shrink-0 text-slate-550 hover:text-ink"
+         onClick={() => setFault(null)} aria-label="Dismiss">✕</button>
+     </div>
+   </div>,
+   document.body
+ )
+}
+
 /** True while the browser reports no connection. */
 function useOnline() {
  const [online, setOnline] = useState(
@@ -928,6 +994,8 @@ const FRIENDLY = {
  denied: "You don't have permission for that.",
  expired: 'Your session has expired. Sign in again.',
  missing: "That isn't there any more.",
+ invalid: "That didn't look right — check the text isn't empty or overly long, and that amounts aren't negative.",
+ duplicate: 'That already exists.',
 }
 
 function ErrorNote({ error, onRetry }) {
@@ -1404,6 +1472,7 @@ function App() {
          : <Dashboard userId={session.user.id} email={session.user.email || ''} online={online} />}
      </main>
      <SiteFooter />
+     <FaultToast />
    </div>
  )
 }
@@ -1891,7 +1960,7 @@ function CreateTripSheet({ open, onClose, onDone }) {
      <form onSubmit={submit} className="space-y-3">
        <div>
          <label className="label" htmlFor="ct-name">Trip name</label>
-         <input id="ct-name" className="field" required placeholder="Goa with the college crew" value={form.name} onChange={set('name')} />
+         <input id="ct-name" className="field" required maxLength={120} placeholder="Goa with the college crew" value={form.name} onChange={set('name')} />
        </div>
        <div>
          <label className="label" htmlFor="ct-dest">Where to</label>
@@ -2156,10 +2225,11 @@ function PlanTab({ trip, members, me, version }) {
  const defaultDay = trip.start_date || new Date().toISOString().slice(0, 10)
 
  async function addItem(v) {
+   if (!v.title?.trim()) throw new Error('Give the stop a name')
    if (!v.start_time) throw new Error('Pick a start time')
    await api.insert('itinerary_items', {
-     trip_id: trip.id, title: v.title, description: v.description || '',
-     location: v.location || '', category: v.category,
+     trip_id: trip.id, title: v.title.trim(), description: (v.description || '').trim(),
+     location: (v.location || '').trim(), category: v.category,
      start_time: new Date(v.start_time).toISOString(),
      end_time: v.end_time ? new Date(v.end_time).toISOString() : null,
    })
@@ -2177,7 +2247,7 @@ function PlanTab({ trip, members, me, version }) {
            <Fields onSubmit={addItem}>
              <div>
                <label className="label" htmlFor="it-title">What's happening</label>
-               <input id="it-title" name="title" className="field" required placeholder="Ferry to Divar" />
+               <input id="it-title" name="title" className="field" required maxLength={200} placeholder="Ferry to Divar" />
              </div>
              <div className="grid gap-3 sm:grid-cols-2">
                <div>
@@ -2607,7 +2677,9 @@ function PollsTab({ trip, members, me, version }) {
        <AddBlock openLabel="Start a poll" cta="Post poll">
          <Fields onSubmit={async (v) => {
            const options = v.options.split('\n').map((s) => s.trim()).filter(Boolean)
+           if (!v.question?.trim()) throw new Error('Type the question first')
            if (options.length < 2) throw new Error('Give at least two options, one per line')
+           if (options.length > 20) throw new Error('Twenty options is the most a poll can hold')
            await api.insert('polls', {
              trip_id: trip.id, question: v.question, options,
              show_voters: v.show_voters === 'on',
@@ -2616,7 +2688,7 @@ function PollsTab({ trip, members, me, version }) {
          }}>
            <div>
              <label className="label" htmlFor="pl-q">Question</label>
-             <input id="pl-q" name="question" className="field" required placeholder="Where do we eat on Friday?" />
+             <input id="pl-q" name="question" className="field" required maxLength={300} placeholder="Where do we eat on Friday?" />
            </div>
            <div>
              <label className="label" htmlFor="pl-o">Options, one per line</label>
@@ -2827,7 +2899,7 @@ function Composer({ trip, members, onDone }) {
      {kind === 'notice' && (
        <div className="mb-2">
          <label className="label" htmlFor="bd-title">Headline (optional)</label>
-         <input id="bd-title" className="field" placeholder="Cab leaves at 6.40 sharp"
+         <input id="bd-title" className="field" maxLength={200} placeholder="Cab leaves at 6.40 sharp"
            value={form.title} onChange={set('title')} />
        </div>
      )}
@@ -2836,7 +2908,7 @@ function Composer({ trip, members, onDone }) {
        <label className="label" htmlFor="bd-body">
          {kind === 'notice' ? 'What everyone should know' : 'Your question'}
        </label>
-       <textarea id="bd-body" className="field" value={form.body} onChange={set('body')}
+       <textarea id="bd-body" className="field" maxLength={4000} value={form.body} onChange={set('body')}
          placeholder={kind === 'notice'
            ? 'Meet in the lobby with bags packed.'
            : "Who's in for breakfast at 8, and where do we meet?"} />
@@ -2912,7 +2984,9 @@ function PostCard({ post, trip, members, me, admin, onChange }) {
            <span className="muted num block">
              {st.replies} {st.replies === 1 ? 'answer' : 'answers'} from {st.answered} of {st.target}
              {' · '}
-             {st.reason === 'wrapped' ? `wrapped ${relativeTime(post.closed_at)}` : 'everyone answered'}
+             {st.reason === 'wrapped'
+             ? `wrapped ${relativeTime(post.closed_at)}${post.closed_by ? ` by ${firstNameOf(nameOf(members, post.closed_by))}` : ''}`
+             : 'everyone answered'}
            </span>
          </span>
          <span className="muted shrink-0">Open</span>
@@ -3054,7 +3128,7 @@ function SharedLinks({ trip, members, me, admin, version }) {
          }}>
            <div>
              <label className="label" htmlFor="ln-title">What is it</label>
-             <input id="ln-title" name="title" className="field" placeholder="Day 1 photos — Drive folder" />
+             <input id="ln-title" name="title" className="field" maxLength={120} placeholder="Day 1 photos — Drive folder" />
            </div>
            <div>
              <label className="label" htmlFor="ln-url">Link</label>
@@ -3079,7 +3153,7 @@ function SharedLinks({ trip, members, me, admin, version }) {
          return (
            <li key={l.id} className="flex items-center gap-1">
              {/* The whole row is the link — title, service and all. */}
-             <a href={l.url} target="_blank" rel="noreferrer"
+             <a href={safeUrl(l.url)} target="_blank" rel="noreferrer"
                className="group flex min-w-0 flex-1 items-center gap-3 rounded-md px-2 py-2 transition-colors hover:bg-paper">
                <span className="grid h-9 w-9 shrink-0 place-items-center rounded-md border border-line bg-white text-slate-550">
                  <svc.Mark />
@@ -3126,6 +3200,7 @@ function ChecklistTab({ trip, members, me, version }) {
  const allChecks = checks.data || []
  const shared = rows.filter((r) => !r.is_private)
  const privateRows = rows.filter((r) => r.is_private)
+ const admin = isAdmin(members, me)
 
  async function add(e) {
    e.preventDefault()
@@ -3162,7 +3237,7 @@ function ChecklistTab({ trip, members, me, version }) {
            ))}
          </div>
          <div className="flex flex-col gap-2 sm:flex-row">
-           <input className="field sm:flex-1" value={title} onChange={(e) => setTitle(e.target.value)}
+           <input className="field sm:flex-1" maxLength={200} value={title} onChange={(e) => setTitle(e.target.value)}
              aria-label={scope === 'shared' ? 'Add to the shared list' : 'Add to your private list'}
              placeholder={scope === 'shared' ? 'Power bank and adapters' : 'My passport and travel card'} />
            <button type="submit" className="btn btn-brand" disabled={busy}>
@@ -3181,21 +3256,21 @@ function ChecklistTab({ trip, members, me, version }) {
      <ChecklistSection
        title="Everyone's list"
        subtitle="What the group should remember — anyone can add"
-       rows={shared} checks={allChecks} trip={trip} members={members} me={me}
+       rows={shared} checks={allChecks} trip={trip} members={members} me={me} admin={admin}
        onChange={() => { list.reload(); checks.reload() }}
        emptyHint="Add the things that always get forgotten. Everyone sees the same list." />
 
      <ChecklistSection
        title="Just for me"
        subtitle="Private to you"
-       rows={privateRows} checks={allChecks} trip={trip} members={members} me={me}
+       rows={privateRows} checks={allChecks} trip={trip} members={members} me={me} admin={admin}
        onChange={() => { list.reload(); checks.reload() }}
        emptyHint="Your own reminders. Nobody else on the trip can see these." />
    </div>
  )
 }
 
-function ChecklistSection({ title, subtitle, rows, checks, trip, members, me, onChange, emptyHint }) {
+function ChecklistSection({ title, subtitle, rows, checks, trip, members, me, admin, onChange, emptyHint }) {
  const mineDone = rows.filter((r) => checks.some((c) => c.item_id === r.id && c.user_id === me)).length
 
  return (
@@ -3227,8 +3302,9 @@ function ChecklistSection({ title, subtitle, rows, checks, trip, members, me, on
                  {others.length ? ` · also ticked by ${others.map((c) => nameOf(members, c.user_id)).join(', ')}` : ''}
                </p>
              </div>
-             {(row.created_by === me || !row.is_private) && (
-               <IconButton label="Remove item"
+             {/* Matches checklist_delete: the author or an admin, nobody else. */}
+             {(row.created_by === me || admin) && (
+               <IconButton label={`Remove ${row.title}`}
                  onClick={async () => { await api.remove('checklist_items', row.id); onChange() }} />
              )}
            </li>
@@ -3274,9 +3350,12 @@ function SafetyTab({ trip, members, me, version }) {
        <div className="mb-4">
          <AddBlock openLabel="Add a contact" cta="Save contact">
            <Fields onSubmit={async (v) => {
+             if (!v.name?.trim()) throw new Error('Give the contact a name')
+             if (!v.phone?.trim()) throw new Error('A phone number is needed')
              await api.insert('emergency_contacts', {
-               trip_id: trip.id, for_user: v.for_user || null, name: v.name,
-               relation: v.relation || '', phone: v.phone, notes: v.notes || '',
+               trip_id: trip.id, for_user: v.for_user || null, name: v.name.trim(),
+               relation: (v.relation || '').trim(), phone: v.phone.trim(),
+               notes: (v.notes || '').trim(),
              })
              contacts.reload()
            }}>
@@ -3292,7 +3371,7 @@ function SafetyTab({ trip, members, me, version }) {
              <div className="grid gap-3 sm:grid-cols-2">
                <div>
                  <label className="label" htmlFor="ec-name">Contact name</label>
-                 <input id="ec-name" name="name" className="field" required placeholder="Ramesh Sharma" />
+                 <input id="ec-name" name="name" className="field" required maxLength={120} placeholder="Ramesh Sharma" />
                </div>
                <div>
                  <label className="label" htmlFor="ec-rel">Type</label>
@@ -3302,7 +3381,7 @@ function SafetyTab({ trip, members, me, version }) {
              </div>
              <div>
                <label className="label" htmlFor="ec-phone">Phone</label>
-               <input id="ec-phone" name="phone" className="field" required inputMode="tel" placeholder="+91 98765 43210" />
+               <input id="ec-phone" name="phone" className="field" required inputMode="tel" maxLength={40} placeholder="+91 98765 43210" />
              </div>
              <div>
                <label className="label" htmlFor="ec-notes">Notes</label>
@@ -3341,7 +3420,7 @@ function SafetyTab({ trip, members, me, version }) {
                        </p>
                        {c.notes && <p className="muted">{c.notes}</p>}
                      </div>
-                     <a href={`tel:${c.phone.replace(/\s/g, '')}`} className="btn btn-ghost btn-sm num">{c.phone}</a>
+                     <a href={telUrl(c.phone)} className="btn btn-ghost btn-sm num">{c.phone}</a>
                      {(c.created_by === me || c.for_user === me) && (
                        <IconButton label="Remove contact"
                          onClick={async () => { await api.remove('emergency_contacts', c.id); contacts.reload() }} />
@@ -3360,7 +3439,7 @@ function SafetyTab({ trip, members, me, version }) {
              <li key={m.id} className="flex items-center justify-between gap-3 text-sm">
                <span>{m.name}</span>
                {m.phone
-                 ? <a href={`tel:${m.phone.replace(/\s/g, '')}`} className="num text-brand hover:underline">{m.phone}</a>
+                 ? <a href={telUrl(m.phone)} className="num text-brand hover:underline">{m.phone}</a>
                  : <span className="muted">no number saved</span>}
              </li>
            ))}
@@ -3830,7 +3909,7 @@ function AddExpenseSheet({ open, trip, members, me, onClose, onDone }) {
        <div className="grid grid-cols-2 gap-3">
          <div>
            <label className="label" htmlFor="ex-amt">Amount ({trip.currency})</label>
-           <input id="ex-amt" type="number" min="0" step="0.01" inputMode="decimal" className="field num"
+           <input id="ex-amt" type="number" min="0.01" step="0.01" inputMode="decimal" className="field num"
              required value={form.amount} onChange={set('amount')} />
          </div>
          <div>
@@ -4004,14 +4083,23 @@ function SettleUp({ trip, members, me, net, history, onChange }) {
    <div className="space-y-4">
      <Panel title="Where everyone stands" subtitle="After every expense and payment recorded">
        <ul className="divide-y divide-line">
-         {members.map((m) => {
+         {/* Anyone who touched the money, including members who have since
+             left — otherwise their share would silently vanish. */}
+         {[
+           ...members,
+           ...Object.keys(net)
+             .filter((id) => !members.some((m) => m.id === id))
+             .map((id) => ({ id, name: 'Former member', gone: true })),
+         ].map((m) => {
            const value = net[m.id] ?? 0
            const flat = Math.abs(value) < 0.01
            return (
              <li key={m.id} className="flex items-center gap-3 py-2.5">
                <Avatar name={m.name} id={m.id} size="sm" />
                <span className="min-w-0 flex-1 truncate text-sm">
-                 {m.name}{m.id === me && <span className="text-slate-550"> · you</span>}
+                 {m.name}
+                 {m.id === me && <span className="text-slate-550"> · you</span>}
+                 {m.gone && <span className="text-slate-550"> · left the trip</span>}
                </span>
                <span className={cls('num text-sm font-medium',
                  flat ? 'text-slate-550' : value > 0 ? 'text-brand' : 'text-alert')}>
