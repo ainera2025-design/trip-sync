@@ -1,6 +1,6 @@
 -- ============================================================================
 
--- Revision 2026-09-16d  (run this whole file, top to bottom, not a selection)
+-- Revision 2026-09-16h  (run this whole file, top to bottom, not a selection)
 
 -- TripSync — complete database schema for Supabase (Postgres)
 
@@ -11,7 +11,7 @@
 
  
 
-do $$ begin raise notice 'TripSync schema revision 2026-09-16d'; end $$;
+do $$ begin raise notice 'TripSync schema revision 2026-09-16h'; end $$;
 
 
  
@@ -520,6 +520,30 @@ create index if not exists idx_checks_trip on public.checklist_checks(trip_id, u
 
 create index if not exists idx_sugvotes_trip on public.suggestion_votes(trip_id, suggestion_id);
 
+-- Every list in the app filters by trip_id, so each trip-scoped table gets one.
+
+create index if not exists idx_suggestions_trip on public.suggestions(trip_id);
+
+create index if not exists idx_attendance_trip on public.attendance(trip_id);
+
+create index if not exists idx_attendance_user on public.attendance(user_id);
+
+create index if not exists idx_polls_trip on public.polls(trip_id);
+
+create index if not exists idx_checklist_trip on public.checklist_items(trip_id);
+
+create index if not exists idx_checks_user on public.checklist_checks(user_id);
+
+create index if not exists idx_contacts_trip on public.emergency_contacts(trip_id);
+
+create index if not exists idx_settlements_trip on public.settlements(trip_id);
+
+create index if not exists idx_links_trip on public.trip_links(trip_id);
+
+create index if not exists idx_locations_user on public.member_locations(user_id);
+
+create index if not exists idx_sugvotes_user on public.suggestion_votes(user_id);
+
 create index if not exists idx_posts_trip on public.posts(trip_id, created_at desc);
 
 create index if not exists idx_replies_post on public.post_replies(post_id, created_at);
@@ -781,6 +805,57 @@ begin
 
  
 
+  if p_amount < 0.01 then
+
+    raise exception 'An expense needs to be at least 0.01';
+
+  end if;
+
+
+ 
+
+  -- The payer and everyone sharing must be on the trip, or their part of the
+
+  -- money would never appear in anybody's balance.
+
+  if not exists (
+
+    select 1 from public.trip_members
+
+    where trip_id = p_trip and user_id = p_paid_by
+
+  ) then
+
+    raise exception 'The payer is not a member of this trip';
+
+  end if;
+
+
+ 
+
+  if exists (
+
+    select 1
+
+    from jsonb_array_elements(coalesce(p_shares, '[]'::jsonb)) s
+
+    where not exists (
+
+      select 1 from public.trip_members m
+
+      where m.trip_id = p_trip and m.user_id = (s->>'user_id')::uuid
+
+    )
+
+  ) then
+
+    raise exception 'A share was assigned to somebody who is not on this trip';
+
+  end if;
+
+
+ 
+
   select coalesce(sum((s->>'amount')::numeric), 0) into total
 
   from jsonb_array_elements(coalesce(p_shares, '[]'::jsonb)) s;
@@ -875,6 +950,41 @@ end $$;
 
  
 
+-- Any member may tick a stop off, or put it back. Editing a stop's details
+
+-- stays with its author (see stop_update), but completing one is something
+
+-- the whole group does, so it goes through here instead.
+
+create or replace function public.complete_stop(p_item uuid, p_done boolean)
+
+returns void language plpgsql security definer set search_path = public as $$
+
+declare t uuid;
+
+begin
+
+  select trip_id into t from public.itinerary_items where id = p_item;
+
+  if t is null or not public.is_trip_member(t) then
+
+    raise exception 'Not a member of this trip';
+
+  end if;
+
+  update public.itinerary_items
+
+  set completed_at = case when p_done then now() else null end,
+
+      completed_by = case when p_done then auth.uid() else null end
+
+  where id = p_item;
+
+end $$;
+
+
+ 
+
 -- Any member may wrap a question round early, or undo it.
 
 create or replace function public.wrap_post(p_post uuid, p_wrapped boolean)
@@ -939,7 +1049,9 @@ returns jsonb language sql stable security definer set search_path = public as $
 
   select case when public.is_trip_member(p_trip) then jsonb_strip_nulls(jsonb_build_object(
 
-    'plan', (select max(created_at) from public.itinerary_items where trip_id = p_trip),
+    'plan', (select max(greatest(created_at, coalesce(completed_at, created_at)))
+
+             from public.itinerary_items where trip_id = p_trip),
 
     'plan_notes', (select max(created_at) from public.suggestions where trip_id = p_trip),
 
@@ -996,6 +1108,8 @@ grant execute on function public.leave_trip(uuid) to authenticated;
 grant execute on function public.set_member_role(uuid, uuid, text) to authenticated;
 
 grant execute on function public.wrap_post(uuid, boolean) to authenticated;
+
+grant execute on function public.complete_stop(uuid, boolean) to authenticated;
 
 grant execute on function public.mark_seen(uuid, text) to authenticated;
 
@@ -1953,6 +2067,300 @@ begin
       add constraint trip_members_role_check check (role in ('admin', 'member'));
 
   end if;
+
+end $$;
+
+
+ 
+
+-- ---------------------------------------------------------------------------
+
+-- 9. One target for person columns (revision f)
+
+--
+
+-- Early tables pointed their person columns at auth.users, later ones at
+
+-- public.profiles. Only a profiles reference can be embedded by PostgREST, so
+
+-- a future query that wants to join a name through, say, itinerary_items
+
+-- would fail for no visible reason. Every profile row already exists (the
+
+-- signup trigger plus the backfill above), so repointing is safe.
+
+-- ---------------------------------------------------------------------------
+
+
+ 
+
+do $$
+
+declare
+
+  r record;
+
+  fk text;
+
+begin
+
+  for r in
+
+    select * from (values
+
+      ('itinerary_items', 'created_by'), ('suggestions', 'created_by'),
+
+      ('attendance', 'user_id'), ('polls', 'created_by'), ('poll_votes', 'user_id'),
+
+      ('checklist_items', 'created_by'), ('emergency_contacts', 'created_by'),
+
+      ('expenses', 'paid_by'), ('expenses', 'created_by'), ('expense_shares', 'user_id'),
+
+      ('settlements', 'from_user'), ('settlements', 'to_user'), ('settlements', 'created_by'),
+
+      ('member_locations', 'user_id'), ('trips', 'created_by')
+
+    ) as t(tbl, col)
+
+  loop
+
+    -- only repoint rows that can be matched; a missing profile would fail the
+
+    -- constraint, so make sure one exists first
+
+    insert into public.profiles (id, full_name, phone)
+
+    select u.id, coalesce(u.raw_user_meta_data->>'full_name', split_part(u.email, '@', 1)), ''
+
+    from auth.users u
+
+    on conflict (id) do nothing;
+
+
+ 
+
+    select conname into fk
+
+    from pg_constraint c
+
+    join pg_class rel on rel.oid = c.conrelid
+
+    where rel.relname = r.tbl and c.contype = 'f'
+
+      and c.conkey = array[(
+
+        select attnum from pg_attribute
+
+        where attrelid = rel.oid and attname = r.col
+
+      )::smallint]
+
+    limit 1;
+
+
+ 
+
+    if fk is not null then
+
+      execute format('alter table public.%I drop constraint %I', r.tbl, fk);
+
+    end if;
+
+
+ 
+
+    begin
+
+      execute format(
+
+        'alter table public.%I add constraint %I foreign key (%I) references public.profiles(id) on delete cascade',
+
+        r.tbl, r.tbl || '_' || r.col || '_profiles_fkey', r.col);
+
+    exception when duplicate_object then null;
+
+    end;
+
+  end loop;
+
+end $$;
+
+
+ 
+
+-- ---------------------------------------------------------------------------
+
+-- 10. Input constraints (revision g)
+
+--
+
+-- Found by adversarial testing: the schema accepted a javascript: URL as a
+
+-- shared link (stored XSS), negative budgets, sub-paisa expenses, a poll whose
+
+-- options were a bare string, whitespace-only titles, and 5,000-character
+
+-- text. The interface guarded most of it; the database did not, and the
+
+-- database is the only guard that holds when a request does not come from the
+
+-- interface.
+
+--
+
+-- Each constraint is added defensively: if existing rows violate it, the add
+
+-- is skipped with a notice rather than failing the whole script, so you can
+
+-- clean up and re-run.
+
+-- ---------------------------------------------------------------------------
+
+
+ 
+
+do $$
+
+declare
+
+  r record;
+
+begin
+
+  for r in
+
+    select * from (values
+
+      -- a link must be a real web address, never a script or inline document
+
+      ('trip_links', 'trip_links_url_web',
+
+       $q$url ~* '^https?://[^\s]+$'$q$),
+
+      ('trip_links', 'trip_links_title_len',
+
+       $q$btrim(title) <> '' and length(title) <= 120$q$),
+
+
+ 
+
+      -- money cannot be negative, and an expense must round to something
+
+      ('trip_members', 'trip_members_budget_positive', $q$budget >= 0$q$),
+
+      ('budget_lines', 'budget_lines_planned_positive', $q$planned >= 0$q$),
+
+      ('trips', 'trips_budget_positive', $q$budget >= 0$q$),
+
+      -- an upper bound is not a business rule, just a fat-finger catch: a
+
+      -- settlement or expense with a few too many zeros should be rejected,
+
+      -- not silently distort every balance on the trip
+
+      ('expenses', 'expenses_amount_min', $q$amount >= 0.01$q$),
+
+      ('expenses', 'expenses_amount_max', $q$amount <= 10000000$q$),
+
+      ('settlements', 'settlements_amount_min', $q$amount >= 0.01$q$),
+
+      ('settlements', 'settlements_amount_max', $q$amount <= 10000000$q$),
+
+      ('budget_lines', 'budget_lines_planned_max', $q$planned <= 10000000$q$),
+
+      ('trip_members', 'trip_members_budget_max', $q$budget <= 10000000$q$),
+
+      ('trips', 'trips_budget_max', $q$budget <= 10000000$q$),
+
+
+ 
+
+      -- a poll needs a real list of at least two things to choose between
+
+      ('polls', 'polls_options_shape',
+
+       $q$jsonb_typeof(options) = 'array'
+
+          and jsonb_array_length(options) between 2 and 20$q$),
+
+      ('polls', 'polls_question_len',
+
+       $q$btrim(question) <> '' and length(question) <= 300$q$),
+
+
+ 
+
+      -- text that is only whitespace renders as an empty row
+
+      ('trips', 'trips_name_len', $q$btrim(name) <> '' and length(name) <= 120$q$),
+
+      ('itinerary_items', 'itinerary_title_len',
+
+       $q$btrim(title) <> '' and length(title) <= 200$q$),
+
+      ('itinerary_items', 'itinerary_desc_len', $q$length(coalesce(description, '')) <= 2000$q$),
+
+      ('posts', 'posts_body_len', $q$btrim(body) <> '' and length(body) <= 4000$q$),
+
+      ('posts', 'posts_title_len', $q$length(coalesce(title, '')) <= 200$q$),
+
+      ('post_replies', 'post_replies_body_len',
+
+       $q$btrim(body) <> '' and length(body) <= 2000$q$),
+
+      ('suggestions', 'suggestions_body_len',
+
+       $q$btrim(body) <> '' and length(body) <= 2000$q$),
+
+      ('checklist_items', 'checklist_title_len',
+
+       $q$btrim(title) <> '' and length(title) <= 200$q$),
+
+      ('emergency_contacts', 'contacts_name_len',
+
+       $q$btrim(name) <> '' and length(name) <= 120$q$),
+
+      ('emergency_contacts', 'contacts_phone_len',
+
+       $q$btrim(phone) <> '' and length(phone) <= 40$q$),
+
+      ('status_note', 'skip', $q$true$q$)
+
+    ) as t(tbl, cname, expr)
+
+  loop
+
+    if to_regclass('public.' || r.tbl) is null then
+
+      continue;
+
+    end if;
+
+    if exists (select 1 from pg_constraint where conname = r.cname) then
+
+      continue;
+
+    end if;
+
+    begin
+
+      execute format('alter table public.%I add constraint %I check (%s)',
+
+                     r.tbl, r.cname, r.expr);
+
+    exception
+
+      when check_violation then
+
+        raise notice 'skipped %: existing rows violate it, clean up and re-run', r.cname;
+
+      when others then
+
+        raise notice 'skipped %: %', r.cname, sqlerrm;
+
+    end;
+
+  end loop;
 
 end $$;
 
