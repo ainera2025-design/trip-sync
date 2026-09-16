@@ -1,34 +1,26 @@
-# Netlify turns your environment variables into env.js at deploy time, so the
-# keys live in Netlify rather than in the repository.
-#
-# Set these in Site configuration -> Environment variables:
-#   SUPABASE_URL
-#   SUPABASE_ANON_KEY
+# Netlify generates env.js during deployment.
+# Set SUPABASE_URL and SUPABASE_ANON_KEY in Netlify
+# Site configuration -> Environment variables.
 
 [build]
- publish = "."
- command = """
-   printf 'window.TRIPSYNC_ENV={url:"%s",anonKey:"%s"};' \
-     "$SUPABASE_URL" "$SUPABASE_ANON_KEY" > env.js && \
-   test -s env.js && grep -q 'supabase.co' env.js
- """
+  publish = "."
+  command = "printf 'window.TRIPSYNC_ENV={url:\"%s\",anonKey:\"%s\"};' \"$SUPABASE_URL\" \"$SUPABASE_ANON_KEY\" > ./env.js && test -s ./env.js && grep -q 'supabase.co' ./env.js"
 
-# Hash routing means every path must serve index.html.
+# Hash routing: serve index.html for application routes.
 [[redirects]]
- from = "/*"
- to = "/index.html"
- status = 200
+  from = "/*"
+  to = "/index.html"
+  status = 200
 
 [[headers]]
- for = "/*"
- [headers.values]
-   X-Frame-Options = "DENY"
-   X-Content-Type-Options = "nosniff"
-   Referrer-Policy = "strict-origin-when-cross-origin"
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
 
-# env.js is generated per deploy; never let a browser hold an old one.
+# env.js is generated during every deployment.
 [[headers]]
- for = "/env.js"
- [headers.values]
-   Cache-Control = "no-store"
- 
+  for = "/env.js"
+  [headers.values]
+    Cache-Control = "no-store"
